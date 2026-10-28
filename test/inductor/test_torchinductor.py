@@ -8818,6 +8818,50 @@ for dtype in (torch.int32, torch.int64):
             (torch.randn([16, 16]),),
         )
 
+    @parametrize("storage_offset", [0, 1, 4])
+    @parametrize("view_chain", [False, True])
+    def test_clone_storage_relative_view(self, storage_offset, view_chain):
+        def fn(x):
+            y = x.clone()
+            if view_chain:
+                y = y.view(2, 32).transpose(0, 1)
+            return y.as_strided((4, 16), (16, 1), 0) + 1
+
+        x = torch.arange(
+            64 + storage_offset, dtype=torch.float32, device=self.device
+        )[storage_offset:].view(4, 16)
+        self.assertEqual(torch.compile(fn, fullgraph=True)(x), fn(x))
+
+    def test_clone_of_intermediate_storage_relative_view(self):
+        # Returning y realizes it as a buffer, so y[1:] is a view at a nonzero offset.
+        def fn(x):
+            y = x * 2
+            return y, y[1:].clone().as_strided((4, 16), (16, 1), 0) + 1
+
+        x = torch.randn(5, 16, device=self.device)
+        self.assertEqual(torch.compile(fn, fullgraph=True)(x), fn(x))
+
+    @parametrize("view_chain", [False, True])
+    def test_clone_of_offset_view_with_pointwise_users_is_removed(self, view_chain):
+        # Without a storage-relative user, the storage offset does not matter and
+        # the clone stays a no-op.
+        graphs = []
+
+        def fn(x):
+            y = x[1:].clone()
+            if view_chain:
+                y = y.view(2, 32).transpose(0, 1)
+            return y + 1
+
+        x = torch.randn(5, 16, device=self.device)
+        with config.patch(
+            post_grad_custom_post_pass=lambda graph: graphs.append(str(graph)),
+            force_disable_caches=True,
+        ):
+            self.assertEqual(torch.compile(fn, fullgraph=True)(x), fn(x))
+        self.assertTrue(graphs)
+        self.assertNotIn("aten.clone", "".join(graphs))
+
     @torch._inductor.config.patch(fallback_random=True)
     def test_clone_dropout(self):
         def fn(x):

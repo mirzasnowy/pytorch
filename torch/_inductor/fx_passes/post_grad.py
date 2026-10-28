@@ -1527,6 +1527,48 @@ def _collect_output_storage(
     )
 
 
+def _depends_on_storage_offset(node: torch.fx.Node) -> bool:
+    """Whether a user of ``node``, or of a view of it, depends on where it sits in its storage.
+
+    That is a storage-relative op such as ``as_strided``, or a host-side TMA descriptor
+    argument of a user-defined Triton kernel, whose base must be 16-byte aligned.
+    """
+    storage = get_node_storage(node)
+    if storage is None:
+        return False
+    storage_relative = (
+        aten.as_strided.default,
+        aten.as_strided_scatter.default,
+        aten.sym_storage_offset.default,
+    )
+    triton_wrappers = (
+        torch.ops.higher_order.triton_kernel_wrapper_functional,
+        torch.ops.higher_order.triton_kernel_wrapper_mutation,
+    )
+    pending = [node]
+    seen = OrderedSet([node])
+    while pending:
+        current = pending.pop()
+        for user in current.users:
+            if user.target in storage_relative:
+                return True
+            if user.target in triton_wrappers:
+                kernel_args = user.kwargs["kwargs"]
+                if any(
+                    kernel_args.get(name) is current
+                    for name in user.kwargs.get("tma_descriptor_metadata", {})
+                ):
+                    return True
+            elif (
+                user.op == "call_function"
+                and user not in seen
+                and get_node_storage(user) == storage
+            ):
+                seen.add(user)
+                pending.append(user)
+    return False
+
+
 def remove_noop_ops(graph: torch.fx.Graph):
     """
     Removes both operations that are essentially aten.clone and operations that are essentially aten.alias from the graph.
@@ -1622,10 +1664,14 @@ def remove_noop_ops(graph: torch.fx.Graph):
             is_valid, args, kwargs = get_fake_args_kwargs(node)
             if not is_valid:
                 continue
+            # A non-view noop such as clone has fresh storage at offset 0. Replacing it
+            # with a source at another offset changes what storage-relative users read,
+            # so compare offsets only when such a user exists.
             if same_tensor_meta(
                 node,
                 src,
-                skip_storage_offset=True,
+                skip_storage_offset=node_is_view
+                or not _depends_on_storage_offset(node),
             ) and cond(*args, **kwargs):
                 node.replace_all_uses_with(src)
                 graph.erase_node(node)
