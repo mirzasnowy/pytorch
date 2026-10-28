@@ -2,6 +2,10 @@
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
 #include <torch/csrc/inductor/aoti_torch/utils.h>
 
+#include <ATen/Context.h>
+#include <ATen/cuda/CUDAGeneratorImpl.h>
+#include <ATen/cuda/CUDAGraph.h>
+#include <ATen/cuda/MemPool.h>
 #include <ATen/cuda/tunable/Tunable.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -109,4 +113,55 @@ AOTITorchError aoti_torch_cuda_caching_allocator_raw_delete(void* ptr) {
       c10::cuda::CUDACachingAllocator::raw_delete(ptr);
     }
   });
+}
+
+AOTITorchError aoti_torch_create_cuda_mem_pool(
+    int32_t device_index,
+    CUDAMemPoolHandle* ret_pool) {
+  AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE({
+    // MemPool needs an initialized caching allocator on the current device.
+    at::globalContext().lazyInitDevice(c10::DeviceType::CUDA);
+    at::cuda::CUDAGuard device_guard(
+        static_cast<c10::DeviceIndex>(device_index));
+    *ret_pool = reinterpret_cast<CUDAMemPoolHandle>(new at::cuda::MemPool());
+  });
+}
+
+AOTITorchError aoti_torch_delete_cuda_mem_pool(CUDAMemPoolHandle pool) {
+  AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE(
+      { delete reinterpret_cast<at::cuda::MemPool*>(pool); });
+}
+
+AOTITorchError aoti_torch_create_cuda_graph(CUDAGraphHandle* ret_graph) {
+  AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE({
+    *ret_graph = reinterpret_cast<CUDAGraphHandle>(new at::cuda::CUDAGraph());
+  });
+}
+
+AOTITorchError aoti_torch_delete_cuda_graph(CUDAGraphHandle graph) {
+  AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE(
+      { delete reinterpret_cast<at::cuda::CUDAGraph*>(graph); });
+}
+
+AOTITorchError aoti_torch_cuda_graph_capture_begin(
+    CUDAGraphHandle graph,
+    CUDAMemPoolHandle pool) {
+  AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE({
+    auto* mem_pool = reinterpret_cast<at::cuda::MemPool*>(pool);
+    // Python creates the default generators when it initializes CUDA; other
+    // hosts would create one lazily inside the capture, which fails.
+    at::cuda::detail::getDefaultCUDAGenerator(mem_pool->device());
+    reinterpret_cast<at::cuda::CUDAGraph*>(graph)->capture_begin(
+        mem_pool->id(), cudaStreamCaptureModeThreadLocal);
+  });
+}
+
+AOTITorchError aoti_torch_cuda_graph_capture_end(CUDAGraphHandle graph) {
+  AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE(
+      { reinterpret_cast<at::cuda::CUDAGraph*>(graph)->capture_end(); });
+}
+
+AOTITorchError aoti_torch_cuda_graph_replay(CUDAGraphHandle graph) {
+  AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE(
+      { reinterpret_cast<at::cuda::CUDAGraph*>(graph)->replay(); });
 }
