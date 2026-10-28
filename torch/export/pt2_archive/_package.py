@@ -737,12 +737,34 @@ class AOTICompiledModel:
         self.loader = loader
 
     def __call__(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return self._run(self.loader.boxed_run, args, kwargs)
+
+    def run_with_cuda_graph(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        """
+        Like calling the model, but runs it as CUDA graphs that the runtime
+        captures and replays. Requires a CUDA model compiled with
+        ``aot_inductor.cudagraphs=True``.
+
+        The first call with new input shapes and strides runs eagerly and the
+        next one captures a graph that later calls replay; a thread's first
+        call on each model instance also runs eagerly. Past
+        ``AOTI_RUNTIME_CUDA_GRAPH_MAX_GRAPHS`` graphs per model instance (an
+        environment variable, default 8), new shapes run eagerly. Replayed
+        outputs are copies: they don't alias the inputs, and outputs that were
+        views of each other come back separate. Each model instance has its
+        own graphs and memory pool. Once a graph was captured, the active
+        constants can't be changed; ``load_constants`` into the active buffer
+        fails.
+        """
+        return self._run(self.loader.run_with_cuda_graph, args, kwargs)
+
+    def _run(self, run_fn, args, kwargs):  # type: ignore[no-untyped-def]
         call_spec = self.loader.get_call_spec()
         in_spec = pytree.treespec_loads(call_spec[0])
         out_spec = pytree.treespec_loads(call_spec[1])
         flat_inputs = pytree.tree_flatten((args, reorder_kwargs(kwargs, in_spec)))[0]
         flat_inputs = [x for x in flat_inputs if isinstance(x, torch.Tensor)]
-        flat_outputs = self.loader.boxed_run(flat_inputs)
+        flat_outputs = run_fn(flat_inputs)
         return pytree.tree_unflatten(flat_outputs, out_spec)
 
     def get_metadata(self) -> dict[str, str]:

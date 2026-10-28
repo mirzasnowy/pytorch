@@ -170,6 +170,31 @@ AOTI_API AOTIRuntimeError AOTInductorModelContainerRunSingleThreaded(
     AOTInductorStreamHandle stream_handle,
     AOTIProxyExecutorHandle proxy_executor_handle);
 
+// Like AOTInductorModelContainerRun, but the runtime runs the model as CUDA
+// graphs. The first call with a new set of input shapes and strides runs
+// eagerly, so that lazy initialization happens outside a capture, and the
+// next one captures a CUDA graph, which later calls with those shapes replay.
+// A thread's first call on each model instance also runs eagerly, since some
+// libraries set up per thread. Each model instance captures its own graphs;
+// once it holds AOTI_RUNTIME_CUDA_GRAPH_MAX_GRAPHS of them (default 8), calls
+// with new shapes run eagerly. Graphs keep reading the constants they were
+// captured with, so once any instance captured one, changing the active
+// constants (updating, refolding, swapping or reloading them) fails; the
+// inactive buffer can still be updated. Requires a CUDA model compiled with
+// aot_inductor.cudagraphs=True.
+AOTI_API AOTIRuntimeError AOTInductorModelContainerRunWithCudaGraph(
+    AOTInductorModelContainerHandle container_handle,
+    AtenTensorHandle* input_handles, // array of input AtenTensorHandle; handles
+                                     // are stolen; the array itself is borrowed
+    size_t num_inputs,
+    AtenTensorHandle*
+        output_handles, // array for writing output AtenTensorHandle; handles
+                        // will be stolen by the caller; the array itself is
+                        // borrowed
+    size_t num_outputs,
+    AOTInductorStreamHandle stream_handle,
+    AOTIProxyExecutorHandle proxy_executor_handle);
+
 // Retrieves the number of constants for the model.
 AOTI_API AOTIRuntimeError AOTInductorModelContainerGetNumConstants(
     AOTInductorModelContainerHandle container_handle,
@@ -247,6 +272,8 @@ AOTI_API AOTIRuntimeError AOTInductorModelContainerExtractConstantsMapEntries(
 // The caller retains ownership of the provided handles. The container retains
 // shallow handles to the same tensor storage without copying its data until an
 // entry is replaced or the container is deleted.
+// Fails once the container captured CUDA graphs, unless it only touches the
+// inactive buffer; see AOTInductorModelContainerRunWithCudaGraph.
 AOTI_API AOTIRuntimeError
 AOTInductorModelContainerUpdateUserManagedConstantBuffer(
     AOTInductorModelContainerHandle container_handle,
@@ -267,6 +294,8 @@ AOTInductorModelContainerUpdateUserManagedConstantBufferPairs(
 // Setup the constant buffer in model container with provided ConstantMap
 // use_inactive should be set as true if the inactive buffer is to be updated.
 // validate_full_update checks if all constants are included in the ConstantMap
+// Fails once the container captured CUDA graphs, unless it only touches the
+// inactive buffer; see AOTInductorModelContainerRunWithCudaGraph.
 //
 // DEPRECATED: V1 API; see AOTInductorModelContainerUpdateConstantBufferPairs.
 AOTI_API AOTIRuntimeError AOTInductorModelContainerUpdateConstantBuffer(
@@ -325,6 +354,8 @@ AOTI_API AOTIRuntimeError AOTInductorModelContainerFreeInactiveConstantBuffer(
     AOTInductorModelContainerHandle container_handle);
 
 // Run constant folding on constant buffer.
+// Fails once the container captured CUDA graphs, unless it only touches the
+// inactive buffer; see AOTInductorModelContainerRunWithCudaGraph.
 AOTI_API AOTIRuntimeError AOTInductorModelContainerRunConstantFolding(
     AOTInductorModelContainerHandle container_handle,
     bool use_inactive,
@@ -332,6 +363,8 @@ AOTI_API AOTIRuntimeError AOTInductorModelContainerRunConstantFolding(
     AOTIProxyExecutorHandle proxy_executor_handle);
 
 // Swap the constant buffer being used to the inactive one.
+// Fails once the container captured CUDA graphs; see
+// AOTInductorModelContainerRunWithCudaGraph.
 AOTI_API AOTIRuntimeError AOTInductorModelContainerSwapConstantBuffer(
     AOTInductorModelContainerHandle container_handle);
 
@@ -411,6 +444,8 @@ AOTI_API AOTIRuntimeError AOTInductorModelContainerDidCallLoadConstants(
     bool* did_call_load_constants);
 
 // Load weights from a single blob in weight_blob_ptr
+// Fails once the container captured CUDA graphs; see
+// AOTInductorModelContainerRunWithCudaGraph.
 AOTI_API AOTIRuntimeError AOTInductorModelUpdateConstantsFromBlob(
     AOTInductorModelContainerHandle container_handle,
     const uint8_t* weight_blob_ptr);
