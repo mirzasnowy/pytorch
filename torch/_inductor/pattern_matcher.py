@@ -36,6 +36,7 @@ successful match or a `FailedMatch` object for a failure to match.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import functools
 import importlib
@@ -68,7 +69,11 @@ from torch._subclasses.fake_tensor import (
     maybe_get_fake_constant,
     unset_fake_temporarily,
 )
-from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.experimental.proxy_tensor import (
+    _coor_device_index_is_current,
+    _coor_enabled,
+    make_fx,
+)
 from torch.fx.experimental.symbolic_shapes import (
     guard_or_false,
     ShapeEnv,
@@ -358,18 +363,8 @@ class Match:
         # pyrefly: ignore [bad-context-manager]
         with context:
             if trace_fn is None:
-                # Under compile-on-one-rank the graph stays rank-agnostic until
-                # post_grad's respecialize_current_device_nodes, so a replacement
-                # spliced in before then must not bake the compiling rank's device.
-                rank_agnostic = bool(
-                    self.graph.find_nodes(
-                        op="call_function", target=torch.ops.coor.current_device.default
-                    )
-                )
                 trace_fn = functools.partial(
-                    fwd_only,
-                    run_functional_passes=run_functional_passes,
-                    is_replacement=rank_agnostic,
+                    fwd_only, run_functional_passes=run_functional_passes
                 )
 
             if should_propagate_eager_input_vals(self.nodes):
@@ -440,6 +435,7 @@ class Match:
                         example_vals, _convert_to_fake_mode
                     )
                 replacement = trace_fn(replacement_fn, example_vals)
+            _use_current_device_node(replacement)
             if len(self.nodes) == 1:
                 for n in replacement.graph.nodes:
                     _transfer_meta(
@@ -1127,6 +1123,20 @@ class _TargetArgsExpr(_TargetExpr):
                 if not is_match(child_match):
                     return child_match
                 m.extend(child_match)
+            elif (
+                isinstance(pattern, torch.device)
+                and isinstance(child_node, torch.fx.Node)
+                and child_node.target is torch.ops.coor.current_device.default
+            ):
+                # Under compile-on-one-rank, patterns are traced on the compiling
+                # rank's device while the graph keeps a rank-agnostic device node.
+                if not _coor_device_index_is_current(pattern):
+                    return FailedMatch(
+                        "constant_args: {} {!r}!={pattern!r}",
+                        node,
+                        child_node,
+                        pattern=pattern,
+                    )
             elif isinstance(child_node, torch.fx.Node) or child_node != pattern:
                 return FailedMatch(
                     "constant_args: {} {!r}!={pattern!r}",
@@ -2218,6 +2228,7 @@ def register_replacement(
                 match.replacement_graph = trace_fn(
                     replace_fn, args, get_decomp_fn=get_decomp_fn
                 )
+                _use_current_device_node(match.replacement_graph)
                 match.kwargs = structured_match_kwargs
                 if len(match.nodes) == 1:
                     for n in match.replacement_graph.graph.nodes:
@@ -3148,6 +3159,95 @@ def fx_to_pattern(
     return pattern
 
 
+_in_rank_agnostic_passes = contextvars.ContextVar(
+    "_in_rank_agnostic_passes", default=False
+)
+
+
+@contextlib.contextmanager
+def rank_agnostic_passes() -> Generator[None, None, None]:
+    """Mark passes that run on a graph still carrying coor.current_device() nodes.
+
+    Under compile-on-one-rank the graph stays rank-agnostic until post_grad's
+    respecialize_current_device_nodes, so passes inside this window must not bake
+    this rank's device: they get device operands from rank_agnostic_device.
+
+    This is a property of the pipeline phase, not something stored on the graph.
+    Node presence can't tell the phases apart (a graph with no device operands has
+    no such node either before or after), and a GraphModule.meta flag would be lost
+    on every GraphModule(root, graph) rebuild, such as prepare_for_partitioner's
+    right before the joint passes.
+
+    There is deliberately no check on exit that no node holds this rank's device:
+    it can't tell a device a pass inserted from one already in the incoming graph,
+    and would turn the programs below into crashes, where a leak only costs
+    cross-rank cache sharing (post_grad respecializes the device either way).
+
+    TODO: HOP proxy implementations (auto_functionalized, with_effects, ...) build
+    their nodes with create_proxy directly, bypassing make_fx's compile-on-one-rank
+    rewrite. So an explicit torch.device("cuda", idx) passed to e.g. a mutable
+    custom op reaches the joint graph with its index and still splits the FX graph
+    cache per rank.
+    """
+    token = _in_rank_agnostic_passes.set(True)
+    try:
+        yield
+    finally:
+        _in_rank_agnostic_passes.reset(token)
+
+
+def rank_agnostic() -> bool:
+    """Whether anything inserted into the graph must not bake this rank's device."""
+    return _in_rank_agnostic_passes.get() and _coor_enabled()
+
+
+def rank_agnostic_device(
+    graph: torch.fx.Graph, device: torch.device
+) -> torch.device | torch.fx.Node:
+    """The operand to give a node inserted into ``graph`` for ``device``.
+
+    Inside rank_agnostic_passes under compile-on-one-rank, this rank's current
+    accelerator becomes a coor.current_device() node, the one a CooR trace would have
+    emitted. It goes before the first non-placeholder, so it precedes every use and
+    later calls reuse it. It carries meta["val"] like the nodes make_fx creates: the
+    partitioner only lets a device node be recomputed in the backward when it has one.
+    """
+    if not (rank_agnostic() and _coor_device_index_is_current(device)):
+        return device
+    target = torch.ops.coor.current_device.default
+    first = next(n for n in graph.nodes if n.op != "placeholder")
+    if first.target is target:
+        return first
+    with graph.inserting_before(first):
+        node = graph.call_function(target)
+    node.meta["val"] = device
+    return node
+
+
+def _use_current_device_node(gm: torch.fx.GraphModule) -> None:
+    # trace_fns trace with CooR off, so a replacement bakes this rank's device.
+    # TODO: only the top-level graph is walked, so a replacement containing a HOP
+    # still bakes this rank's device inside the HOP's subgraph.
+    if not rank_agnostic():
+        return
+    graph = gm.graph
+    swapped = False
+
+    def swap(a: Any) -> Any:
+        nonlocal swapped
+        if not isinstance(a, torch.device):
+            return a
+        operand = rank_agnostic_device(graph, a)
+        swapped |= operand is not a
+        return operand
+
+    for n in list(graph.nodes):
+        n.args = torch.fx.node.map_aggregate(n.args, swap)
+        n.kwargs = torch.fx.node.map_aggregate(n.kwargs, swap)
+    if swapped:
+        gm.recompile()
+
+
 @torch.no_grad()
 def fwd_only(
     fn: Callable[..., Any],
@@ -3155,26 +3255,17 @@ def fwd_only(
     *,
     run_functional_passes: bool = True,
     get_decomp_fn: Callable[..., Any] = select_decomp_table,
-    is_replacement: bool = False,
 ) -> torch.fx.GraphModule:
     """Build a normalized inference graph, for use with fx_to_pattern"""
-    import contextlib
-
     from torch.compiler import config as compiler_config
 
     # TODO - look into using aot autograd, asserting no mutating ops here
-    # A pattern template is matched against, never spliced in, so tracing it with a
-    # fixed example device is fine -- and CooR's single-device check would reject it.
-    # A replacement spliced into a still rank-agnostic graph has to be traced with
-    # CooR live or it bakes a rank-specific device into that graph.
-    coor_ctx = (
-        contextlib.nullcontext()
-        if is_replacement
-        # pyrefly: ignore [missing-attribute]
-        else compiler_config.patch(compile_on_one_rank=False)
-    )
+    # Traced on a fixed example device, which CooR's single-device check would reject.
+    # A replacement spliced into a rank-agnostic graph gets its device swapped back
+    # afterwards; see _use_current_device_node.
     with (
-        coor_ctx,
+        # pyrefly: ignore [missing-attribute]
+        compiler_config.patch(compile_on_one_rank=False),
         enable_python_dispatcher(),
         preserve_node_meta(),
     ):
