@@ -1475,6 +1475,17 @@ def check_closure(value: object, metadata: Any) -> bool:
     return id(value) == metadata
 
 
+def _ordered_dict_order(value: collections.OrderedDict[Any, Any]) -> tuple[int, ...]:
+    # Most OrderedDicts retain storage order; avoid allocating a key-position map.
+    if all(
+        stored is linked
+        for stored, linked in zip(dict.keys(value), collections.OrderedDict.keys(value))
+    ):
+        return tuple(range(dict.__len__(value)))
+    positions = {id(key): index for index, key in enumerate(dict.keys(value))}
+    return tuple(positions[id(key)] for key in collections.OrderedDict.keys(value))
+
+
 def _constant_subclass_base_value(value: object) -> Any:
     """Extract the base constant value from a constant subclass instance."""
     from .variables.user_defined import _CONSTANT_BASE_TYPES
@@ -3772,6 +3783,25 @@ class GuardBuilder(GuardBuilderBase):
         self._set_guard_export_info(guard, code)
 
     @register_guard_check_spec(
+        get_metadata_fn=lambda guard, value: _ordered_dict_order(value),
+        eval_fn=lambda value, order: _ordered_dict_order(value) == order,
+    )
+    def ORDERED_DICT_ORDER_MATCH(self, guard: Guard) -> None:
+        self.get_guard_manager(guard)
+        order = _ordered_dict_order(self.get(guard))
+
+        def guard_fn(value: collections.OrderedDict[Any, Any]) -> bool:
+            return _ordered_dict_order(value) == order
+
+        code = [f"___check_order({self.arg_ref(guard)})"]
+        self.add_python_lambda_leaf_guard_to_root(
+            code,
+            get_verbose_code_parts(code, guard),
+            _get_closure_vars() | {"___check_order": guard_fn},
+        )
+        self._set_guard_export_info(guard, code)
+
+    @register_guard_check_spec(
         get_metadata_fn=lambda guard, value: list(dict.keys(value)),
         eval_fn=lambda value, metadata: constants_identical(
             list(dict.keys(value)), metadata
@@ -4906,6 +4936,27 @@ class GuardsStatePickler(FunctionPicklerBase):
         return dict.fromkeys(elems).keys()
 
     @classmethod
+    def _restore_ordered_dict_state(
+        cls,
+        value: collections.OrderedDict[Any, Any],
+        state: tuple[Any, tuple[Any, ...]],
+    ) -> None:
+        attrs, keys = state
+        if hasattr(value, "__setstate__"):
+            value.__setstate__(attrs)
+        else:
+            slots = None
+            if isinstance(attrs, tuple):
+                attrs, slots = attrs
+            if attrs is not None:
+                value.__dict__ = attrs
+            if slots:
+                for name, item in slots.items():
+                    setattr(value, name, item)
+        for key in keys:
+            collections.OrderedDict.move_to_end(value, key)
+
+    @classmethod
     def _unpickle_count_iter(cls, item: int, step: int) -> itertools.count[int]:
         return itertools.count(item, step)
 
@@ -5219,6 +5270,28 @@ class GuardsStatePickler(FunctionPicklerBase):
 
         if id(obj) in self.missing_values:
             return _Missing, ("missing values",)
+
+        if (
+            issubclass(type(obj), collections.OrderedDict)
+            and type(obj) not in copyreg.dispatch_table
+            and type(obj).__reduce__ is collections.OrderedDict.__reduce__
+            and type(obj).__reduce_ex__ is collections.OrderedDict.__reduce_ex__
+        ):
+            # Native pickle normalizes storage to linked order, invalidating
+            # storage-position sources and ORDERED_DICT_ORDER_MATCH on load.
+            state = (
+                vars(obj)
+                if type(obj) is collections.OrderedDict
+                else obj.__reduce__()[2]
+            )
+            return (
+                type(obj),
+                (),
+                (state, tuple(collections.OrderedDict.keys(obj))),
+                None,
+                iter(dict.items(obj)),
+                type(self)._restore_ordered_dict_state,
+            )
 
         if isinstance(obj, torch.Tensor) and obj.device.type != "meta":
             from torch.utils._python_dispatch import is_traceable_wrapper_subclass
