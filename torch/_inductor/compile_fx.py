@@ -1051,6 +1051,10 @@ def compile_fx_inner(
     # compile_fx return and we may want to use the _LazyGraphModule for compiling
     # the backward graph as well.
     with contextlib.ExitStack() as stack:
+        # compile_fx re-applies torch.compile options inside inner_compile, so
+        # options={"triton.cudagraphs": False} would undo override_cudagraphs.
+        if kwargs["cudagraphs"] is not None:
+            stack.enter_context(cudagraph_annotation_context(kwargs["cudagraphs"]))
         # When cpp_wrapper is enabled, ensure the required triton config
         # (store_cubin, autotune_at_compile_time, etc.) is applied. This is
         # needed because lazy backward compilation may run after the
